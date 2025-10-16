@@ -1,0 +1,10 @@
+# --- FastAPI и сервер ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# --- Валидация и типизация ---
+pydantic>=2.9.0
+
+# --- Прочие зависимости ---
+# всё остальное (os, json, time, re, pathlib, typing, collections, hashlib, unicodedata)
+# входит в стандартную библиотеку Python и не требует установки
