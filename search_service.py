@@ -7,18 +7,16 @@ import time
 import re
 import sqlite3
 import unicodedata
-import hashlib
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
-from math import ceil
 from collections import Counter
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse, urlunparse
 
 import requests
-from fastapi import FastAPI, Query, Request, HTTPException, Body, Depends
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, Query, Request, HTTPException, Body
+from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,20 +24,69 @@ from pydantic import BaseModel
 # Конфиг
 # ─────────────────────────────────────────────────────────────
 PRODUCTS_JSON_URL = os.getenv("PRODUCTS_JSON_URL", "https://upravdom.com/upload/catalog.json")
-REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "300"))   # авто-обновление каждые N сек
-HTTP_TIMEOUT      = float(os.getenv("HTTP_TIMEOUT", "30.0"))   # таймаут HTTP, сек
+REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "300"))
+HTTP_TIMEOUT      = float(os.getenv("HTTP_TIMEOUT", "30.0"))
 DISK_CACHE_PATH   = Path(os.getenv("DISK_CACHE_PATH", "./catalog_cache.json"))
 
 MAX_PER_PAGE      = 20
 DEFAULT_PER_PAGE  = 20
 
-# Очерёдность регионов для фоллбека, если в запрошенном регионе нет цены
-FALLBACK_PRIORITY = ["msk", "spb", "moscow", "ekb", "nsk", "nn", "krasnodar", "krd", "adler"]
+# Базовый домен для редиректа на карточки (всегда префиксуем путь из JSON)
+SITE_BASE = os.getenv("SITE_BASE", "https://upravdom.com")
+
+# Ключи регионов для fallback (только канонические)
+FALLBACK_PRIORITY = ["msk", "spb", "ekb", "nsk", "nn", "krd", "adler"]
+
+# Синонимы регионов (домены/ключи из JSON -> канонический ключ)
+REGION_ALIASES = {
+    # Москва
+    "msk": "msk", "moscow": "msk",
+    # Санкт-Петербург
+    "spb": "spb", "sankt-peterburg": "spb", "spb-city": "spb", "piter": "spb", "spbru": "spb",
+    # Екатеринбург
+    "ekb": "ekb", "yekaterinburg": "ekb", "ekaterinburg": "ekb",
+    # Новосибирск
+    "nsk": "nsk", "novosibirsk": "nsk",
+    # Нижний Новгород
+    "nn": "nn", "nizhny-novgorod": "nn", "nizhnij-novgorod": "nn", "nizhniy-novgorod": "nn",
+    # Краснодар
+    "krd": "krd", "krasnodar": "krd",
+    # Прочие
+    "adler": "adler",
+}
+def normalize_region_key(k: str) -> str:
+    k = (k or "").strip().lower()
+    return REGION_ALIASES.get(k, k)
 
 # Аналитика
 DB_PATH        = Path(os.getenv("ANALYTICS_DB", "./analytics.db"))
-ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "devtoken")   # доступ к /admin?token=...
 KEEP_QUERY_IPS = os.getenv("KEEP_QUERY_IPS", "1") == "1"
+
+# API keys (optional). If at least one key is provided via env, /search endpoints will require it.
+# Set env: API_KEYS="key1,key2,..."
+API_KEYS = {
+    k.strip() for k in (os.getenv("API_KEYS", "").split(",") if os.getenv("API_KEYS") else [])
+    if k.strip()
+}
+
+def _get_api_key(request: Request) -> Optional[str]:
+    # Header takes precedence
+    h = request.headers.get("x-api-key")
+    if h:
+        return h.strip()
+    # fallback to query param
+    qp = request.query_params.get("api_key")
+    if qp:
+        return qp.strip()
+    return None
+
+def ensure_api_allowed(request: Request):
+    """Require a valid API key when API_KEYS is configured. No-op if not configured."""
+    if not API_KEYS:
+        return
+    key = _get_api_key(request)
+    if not key or key not in API_KEYS:
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid API key")
 
 # ─────────────────────────────────────────────────────────────
 # Утилиты
@@ -53,7 +100,6 @@ def normalize_text(s: str) -> str:
     return WHITESPACE_RE.sub(" ", s).strip()
 
 def normalize_compact(s: str) -> str:
-    """Компакт для артикулов/цифр: только буквы/цифры, без пробелов и знаков."""
     s = normalize_text(s)
     return re.sub(r"[^a-z0-9а-я]+", "", s)
 
@@ -75,12 +121,8 @@ def _to_float(v: Any) -> Optional[float]:
 
 def coerce_prices_map(prices_field: Union[List[Dict[str, Any]], Dict[str, Any], None]) -> Dict[str, Dict[str, Optional[float]]]:
     """
-    Унифицируем цены в вид:
-      {"spb": {"price": 2500.0, "price_old": None}, ...}
-    Поддержано:
-      - [{"spb": {"price":..,"price_old":..}}, {"msk": {...}}]
-      - {"spb": {"price":..}, "msk": {...}}
-      - None
+    Приводим prices к виду: {"spb": {"price": 2500.0, "price_old": None}, ...}
+    Поддерживаются словарь и список словарей с регионами.
     """
     res: Dict[str, Dict[str, Optional[float]]] = {}
     if prices_field is None:
@@ -88,10 +130,9 @@ def coerce_prices_map(prices_field: Union[List[Dict[str, Any]], Dict[str, Any], 
     if isinstance(prices_field, dict):
         for rk, payload in prices_field.items():
             if isinstance(payload, dict):
-                res[str(rk).lower()] = {
-                    "price": _to_float(payload.get("price")),
-                    "price_old": _to_float(payload.get("price_old")),
-                }
+                key = normalize_region_key(rk)
+                res[key] = {"price": _to_float(payload.get("price")),
+                            "price_old": _to_float(payload.get("price_old"))}
         return res
     if isinstance(prices_field, list):
         for chunk in prices_field:
@@ -99,10 +140,9 @@ def coerce_prices_map(prices_field: Union[List[Dict[str, Any]], Dict[str, Any], 
                 continue
             for rk, payload in chunk.items():
                 if isinstance(payload, dict):
-                    res[str(rk).lower()] = {
-                        "price": _to_float(payload.get("price")),
-                        "price_old": _to_float(payload.get("price_old")),
-                    }
+                    key = normalize_region_key(rk)
+                    res[key] = {"price": _to_float(payload.get("price")),
+                                "price_old": _to_float(payload.get("price_old"))}
         return res
     return res
 
@@ -113,27 +153,25 @@ def extract_subdomain(host: str) -> Optional[str]:
         return parts[0]
     return None
 
-def hard_region_from_host(host: str, known_regions: set) -> str:
+def hard_region_from_host(host: str) -> str:
     """
-    Жёстко:
-      - нет субдомена → 'msk'
-      - есть субдомен и он в known_regions → он
-      - иначе → 'msk'
+    Берём регион строго из субдомена и нормализуем через алиасы.
+    Без субдомена — 'msk'.
     """
     sub = extract_subdomain(host)
     if not sub:
         return "msk"
-    sub = sub.lower()
-    return sub if sub in known_regions else "msk"
+    return normalize_region_key(sub)
 
 def make_etag(*parts: str) -> str:
+    import hashlib
     h = hashlib.sha256()
     for p in parts:
         h.update(p.encode("utf-8"))
     return '"' + h.hexdigest()[:32] + '"'
 
 # ─────────────────────────────────────────────────────────────
-# Модели
+# Модель
 # ─────────────────────────────────────────────────────────────
 class Product(BaseModel):
     name: str
@@ -145,18 +183,15 @@ class Product(BaseModel):
     discount_percent: Optional[float] = None
     prices: Dict[str, Dict[str, Optional[float]]] = {}
 
-    # совместимость/доп
     image: Optional[str] = None
     id_code: Optional[str] = None
     currency: Optional[str] = "RUB"
     type: Optional[str] = None
-
-    # категория/секция/хлебные крошки (если есть)
     category: Optional[str] = None
     section: Optional[str] = None
+    section_norm: Optional[str] = None
     breadcrumbs: Optional[Union[str, List[str]]] = None
 
-    # внутренние поля для быстрого поиска
     _search_blob: Optional[str] = None
     _search_blob_compact: Optional[str] = None
 
@@ -185,10 +220,8 @@ class Catalog:
             parsed = json.loads(text)
         except Exception:
             parsed = None
-
         if isinstance(parsed, list):
             return parsed
-
         if isinstance(parsed, dict):
             for k in ("items", "data", "products", "catalog", "result", "rows", "list", "goods"):
                 v = parsed.get(k)
@@ -197,7 +230,6 @@ class Catalog:
             values = list(parsed.values())
             if values and all(isinstance(x, dict) for x in values):
                 return values
-
         items: List[Dict[str, Any]] = []
         for line in text.splitlines():
             line = line.strip()
@@ -221,7 +253,6 @@ class Catalog:
             known.update(prices_map.keys())
 
             img = it.get("img") or it.get("image") or it.get("picture") or it.get("img_url") or it.get("image_url")
-
             p = Product(
                 name = it.get("name") or it.get("title") or "",
                 url  = it.get("url") or it.get("link"),
@@ -236,26 +267,17 @@ class Catalog:
                 currency = it.get("currency") or "RUB",
                 type = it.get("type") or it.get("category"),
                 category = it.get("category") or it.get("section"),
-                section = it.get("section"),
+                section = it.get("product_section_name") or it.get("section"),
                 breadcrumbs = it.get("breadcrumbs") or it.get("path") or it.get("trail"),
             )
-
+            p.section_norm = normalize_text(p.section) if p.section else None
             crumbs = p.breadcrumbs
             if isinstance(crumbs, list):
                 crumbs = " / ".join(map(str, crumbs))
-            blob_parts = [
-                p.name or "",
-                p.type or "",
-                p.category or "",
-                p.section or "",
-                crumbs or "",
-                p.url or "",
-                p.id_code or "",
-            ]
+            blob_parts = [p.name or "", p.type or "", p.category or "", p.section or "", crumbs or "", p.url or "", p.id_code or ""]
             blob = normalize_text(" ".join(part for part in blob_parts if part))
             p._search_blob = blob
             p._search_blob_compact = normalize_compact(blob)
-
             products.append(p)
 
         with self._lock:
@@ -264,10 +286,7 @@ class Catalog:
             self._mtime_marker = time.time()
 
     def refresh_from_url(self):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; UpravdomSearch/1.0)",
-            "Accept": "application/json",
-        }
+        headers = {"User-Agent": "UpravdomSearch/1.0", "Accept": "application/json"}
         if self._etag:
             headers["If-None-Match"] = self._etag
         if self._last_modified:
@@ -287,7 +306,6 @@ class Catalog:
         items = self._parse_items(text)
         if not isinstance(items, list):
             raise ValueError("Ожидался JSON-массив или NDJSON.")
-
         print(f"[CATALOG] parsed items: {len(items)}")
         self._apply_items(items)
 
@@ -296,8 +314,7 @@ class Catalog:
 
         try:
             self.disk_cache.parent.mkdir(parents=True, exist_ok=True)
-            with self.disk_cache.open("w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False)
+            self.disk_cache.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -345,53 +362,72 @@ class Catalog:
                 print(f"[WARN] Periodic refresh failed: {e}")
             self._stop_event.wait(REFRESH_SECONDS)
 
-    # Поиск
     def search_all(self, query: str, requested_region: str, strict_region: bool = False) -> List[Dict[str, Any]]:
         self.ensure_ready()
 
-        q_lat = normalize_text(query)                 # латиница как есть
-        q_ru  = normalize_text(naive_lat_to_ru(query))# «псевдо-ру»
+        q_lat = normalize_text(query)
+        q_ru  = normalize_text(naive_lat_to_ru(query))
         tokens_lat = [t for t in q_lat.split(" ") if t]
         tokens_ru  = [t for t in q_ru.split(" ") if t]
 
-        STOP = {"quick", "step", "quickstep", "qs"}   # брендовые стоп-слова
-
-        # сильные (с цифрами)
+        # разделяем токены на сильные (с цифрами/артикулы) и слабые (обычные слова)
         strong_lat = [t for t in tokens_lat if any(ch.isdigit() for ch in t)]
         strong_ru  = [t for t in tokens_ru  if any(ch.isdigit() for ch in t)]
-        # слабые (без цифр, не стоп-слова)
-        weak_lat = [t for t in tokens_lat if not any(ch.isdigit() for ch in t) and t not in STOP]
-        weak_ru  = [t for t in tokens_ru  if not any(ch.isdigit() for ch in t) and t not in STOP]
+        weak_lat   = [t for t in tokens_lat if not any(ch.isdigit() for ch in t)]
+        weak_ru    = [t for t in tokens_ru  if not any(ch.isdigit() for ch in t)]
+        # Сильные токены можно объединять (цифры/артикулы).
+        strong_need = list(dict.fromkeys(strong_lat + strong_ru))
+        # Слабые токены берём из одной «доминирующей» раскладки: если есть латиница — используем её,
+        # иначе — русские токены.
+        if weak_lat:
+            weak_need = list(dict.fromkeys(weak_lat))
+        else:
+            weak_need = list(dict.fromkeys(weak_ru))
+
+        # секционный фильтр: если в запросе присутствует слово, совпадающее с известным названием раздела,
+        # фильтруем результаты по этому разделу. Например: "ламинат 1994" → показываем только раздел "ламинат".
+        with self._lock:
+            known_sections = {p.section_norm for p in self.products if getattr(p, 'section_norm', None)}
+        sec_need = [t for t in tokens_ru if t in known_sections]
 
         with self._lock:
             products = list(self.products)
 
         result: List[Dict[str, Any]] = []
         for p in products:
+            # если пользователь явно указал раздел (например, "ламинат"), оставляем только такие позиции
+            if sec_need:
+                if not p.section_norm or p.section_norm not in sec_need:
+                    continue
             blob = p._search_blob or ""
             blob_compact = p._search_blob_compact or normalize_compact(blob)
 
-            # 1) сильные — «все обязательны» по схеме (LAT ИЛИ RU)
+            # утилиты поиска подстрок
+            def any_in_compact(need: List[str]) -> bool:
+                return any(normalize_compact(t) in blob_compact for t in need) if need else False
+            def any_in_blob(need: List[str]) -> bool:
+                return any(t in blob for t in need) if need else False
             def all_in_compact(need: List[str]) -> bool:
                 return all(normalize_compact(t) in blob_compact for t in need) if need else True
-
-            strong_ok = True
-            if strong_lat or strong_ru:
-                strong_ok = (all_in_compact(strong_lat) or all_in_compact(strong_ru))
-            if not strong_ok:
-                continue
-
-            # 2) слабые — «все обязательны» по схеме (LAT ИЛИ RU)
             def all_in_blob(need: List[str]) -> bool:
                 return all(t in blob for t in need) if need else True
 
-            weak_ok = True
-            if weak_lat or weak_ru:
-                weak_ok = (all_in_blob(weak_lat) or all_in_blob(weak_ru))
-            if not weak_ok:
-                continue
+            has_strong = any_in_compact(strong_need)
+            weak_all   = all_in_blob(weak_need) or all_in_compact(weak_need)
 
-            # 3) цены/регион
+            # Правила допуска:
+            # 1) Если есть сильные токены — достаточно совпадения ЛЮБОГО из них (артикул/код выигрывает).
+            #    Но если слабые тоже есть, то все они должны быть покрыты.
+            # 2) Если сильных нет — требуем совпадения всех слабых.
+            if strong_need:
+                if not has_strong:
+                    continue
+                if weak_need and not weak_all:
+                    continue
+            else:
+                if weak_need and not weak_all:
+                    continue
+
             price_block = p.prices.get(requested_region)
             price = price_block["price"] if price_block else None
             price_old = price_block["price_old"] if price_block else None
@@ -403,39 +439,37 @@ class Catalog:
                 for rk in FALLBACK_PRIORITY:
                     blk = p.prices.get(rk)
                     if blk and blk.get("price") is not None:
-                        price = blk["price"]
-                        price_old = blk.get("price_old")
-                        used_region = rk
-                        break
+                        price = blk["price"]; price_old = blk.get("price_old"); used_region = rk; break
                 if price is None:
                     for rk in sorted(p.prices.keys()):
                         blk = p.prices[rk]
                         if blk and blk.get("price") is not None:
-                            price = blk["price"]
-                            price_old = blk.get("price_old")
-                            used_region = rk
-                            break
+                            price = blk["price"]; price_old = blk.get("price_old"); used_region = rk; break
 
-            # 4) скоринг
             score = 0
-            if strong_lat or strong_ru:
-                score += 5
-            score += len(weak_lat) or len(weak_ru)
+            # бонус за сильные совпадения
+            if has_strong:
+                score += 10
+                # дополнительный бонус за число совпавших strong токенов
+                score += sum(1 for t in strong_need if normalize_compact(t) in blob_compact)
+            # бонусы за слабые совпадения
+            weak_hits = sum(1 for t in weak_need if (t in blob) or (normalize_compact(t) in blob_compact))
+            score += weak_hits
+
+            # phrase bonus (e.g., "impressive ultra" occurring contiguously)
+            if weak_need:
+                phrase_compact = normalize_compact(" ".join(weak_need))
+                if phrase_compact and phrase_compact in blob_compact:
+                    score += 5
+                # small bonus if all weak tokens are present
+                if weak_all:
+                    score += len(weak_need)
 
             result.append({
-                "name": p.name,
-                "url": p.url,
-                "img": p.img or p.image,
-                "measure_code": p.measure_code,
-                "sale": p.sale,
-                "is_hit": p.is_hit,
-                "discount_percent": p.discount_percent,
-                "region": used_region,
-                "price": price,
-                "price_old": price_old,
-                "currency": p.currency,
-                "type": p.type,
-                "_score": score,
+                "name": p.name, "url": p.url, "img": p.img or p.image, "measure_code": p.measure_code,
+                "sale": p.sale, "is_hit": p.is_hit, "discount_percent": p.discount_percent,
+                "region": used_region, "price": price, "price_old": price_old,
+                "currency": p.currency, "type": p.type, "_score": score,
             })
 
         def price_key(x):
@@ -448,50 +482,24 @@ class Catalog:
 catalog = Catalog(PRODUCTS_JSON_URL, DISK_CACHE_PATH)
 
 # ─────────────────────────────────────────────────────────────
-# Аналитика (SQLite)
+# Аналитика / БД
 # ─────────────────────────────────────────────────────────────
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS searches(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            ip TEXT,
-            ua TEXT,
-            host TEXT,
-            region TEXT,
-            q TEXT NOT NULL,
-            page INTEGER,
-            per_page INTEGER,
-            total INTEGER,
-            took_ms INTEGER
-        )""")
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS clicks(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            ip TEXT,
-            ua TEXT,
-            host TEXT,
-            region TEXT,
-            q TEXT,
-            item_name TEXT,
-            item_url TEXT,
-            price REAL
-        )""")
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS searches(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+            ip TEXT, ua TEXT, host TEXT, region TEXT, q TEXT NOT NULL,
+            page INTEGER, per_page INTEGER, total INTEGER, took_ms INTEGER)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS clicks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+            ip TEXT, ua TEXT, host TEXT, region TEXT, q TEXT,
+            item_name TEXT, item_url TEXT, price REAL)""")
         con.commit()
 
 def db_execute(sql: str, args: Tuple[Any, ...] = ()):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute(sql, args)
-        con.commit()
-
-def db_query(sql: str, args: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
-        cur = con.execute(sql, args)
-        return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(sql, args); con.commit()
 
 def get_client_ip(request: Request) -> str:
     if not KEEP_QUERY_IPS:
@@ -518,15 +526,16 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────
 # FastAPI
 # ─────────────────────────────────────────────────────────────
-app = FastAPI(title="Upravdom Search API", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Upravdom Search API", version="3.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-API-Key"],
 )
 
+# ── модели запросов/ответов
 class SearchResponse(BaseModel):
     query: str
     requested_region: str
@@ -543,25 +552,94 @@ class SearchRequest(BaseModel):
     page: int = 1
     per_page: int = DEFAULT_PER_PAGE
     strict_region: bool = False
+    region: Optional[str] = None  # <— явный оверрайд
 
-def log_search(request: Request, region: str, q: str, page: int, per_page: int, total: int, started: float):
-    took_ms = int((time.time() - started) * 1000)
-    ip = get_client_ip(request)
-    ua = request.headers.get("user-agent", "")[:400]
+# ── резолвер региона
+def resolve_requested_region(request: Request, region_override: Optional[str] = None) -> str:
+    """
+    Приоритет:
+      1) явный параметр функции (из эндпоинта),
+      2) query-параметр ?region=...,
+      3) X-Forwarded-Host / Host.
+    """
+    # Optional explicit domain override: ?domain=spb.upravdom.com or ?domain=spb
+    qp_domain = request.query_params.get("domain")
+    if qp_domain:
+        dom = (qp_domain or "").strip().lower()
+        # If it looks like a hostname (has a dot), extract region from subdomain
+        if "." in dom:
+            return hard_region_from_host(dom)
+        # Otherwise treat as a region key/synonym
+        return normalize_region_key(dom)
+    if region_override:
+        return normalize_region_key(region_override)
+    qp_region = request.query_params.get("region")
+    if qp_region:
+        return normalize_region_key(qp_region)
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-    db_execute(
-        "INSERT INTO searches(ts, ip, ua, host, region, q, page, per_page, total, took_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (int(time.time()), ip, ua, host, region, q, page, per_page, total, took_ms)
-    )
+    return hard_region_from_host(host)
 
-def paginate_and_respond(request: Request, q: str, page: int, per_page: int, strict_region: bool) -> JSONResponse:
+from datetime import datetime
+
+def _fmt_price(p):
+    if p is None:
+        return "—"
+    try:
+        # целые цены без дробей, иначе 2 знака
+        return ("{:,.0f}" if float(p).is_integer() else "{:,.2f}").format(float(p)).replace(",", " ")
+    except Exception:
+        return str(p)
+
+def render_cli(payload: Dict[str, Any]) -> str:
+    """Форматированный человекопонятный вывод для CLI."""
+    lines = []
+    lines.append("Upravdom Search · query=\"{}\" · region={} · page {}/{} (per_page={})".format(
+        payload.get("query", ""), payload.get("requested_region", ""), payload.get("page", 1),
+        payload.get("pages", 1), payload.get("per_page", 0)))
+    lines.append("total: {} | has_prev: {} | has_next: {}".format(
+        payload.get("total", 0), payload.get("has_prev", False), payload.get("has_next", False)))
+    lines.append("")
+    items = payload.get("items", [])
+    if not items:
+        lines.append("нет результатов")
+        return "\n".join(lines) + "\n"
+
+    # шапка таблицы
+    header = ["#", "Название", "Цена", "Старая", "Регион", "Ед.", "URL"]
+    col_widths = [3, 60, 10, 10, 7, 5, 50]
+    def cut(s, w):
+        s = "" if s is None else str(s)
+        return (s[:w-1] + "…") if len(s) > w else s
+    def row_to_str(cols):
+        pads = ["<", "<", ">", ">", "<", "<", "<"]
+        cells = []
+        for i, (c, w) in enumerate(zip(cols, col_widths)):
+            txt = cut(c, w)
+            if pads[i] == ">":
+                cells.append(txt.rjust(w))
+            else:
+                cells.append(txt.ljust(w))
+        return " ".join(cells)
+
+    lines.append(row_to_str(header))
+    lines.append("-" * (sum(col_widths) + len(col_widths) - 1))
+
+    for idx, it in enumerate(items, 1):
+        name = it.get("name") or "—"
+        price = _fmt_price(it.get("price"))
+        price_old = _fmt_price(it.get("price_old"))
+        region = it.get("region") or "—"
+        unit = it.get("measure_code") or "—"
+        url = it.get("url") or "—"
+        lines.append(row_to_str([str(idx), name, price, price_old, region, unit, url]))
+
+    return "\n".join(lines) + "\n"
+
+def paginate_and_respond(request: Request, q: str, page: int, per_page: int, strict_region: bool, region: Optional[str] = None) -> JSONResponse:
     start = time.time()
     catalog.ensure_ready()
-    with catalog._lock:
-        known = set(catalog.known_regions.keys())
 
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-    requested_region = hard_region_from_host(host, known)
+    requested_region = resolve_requested_region(request, region_override=region)
 
     try:
         all_items = catalog.search_all(q, requested_region, strict_region=strict_region)
@@ -577,63 +655,85 @@ def paginate_and_respond(request: Request, q: str, page: int, per_page: int, str
     end_i = start_i + per_page
     slice_items = all_items[start_i:end_i]
 
-    payload = {
-        "query": q,
-        "requested_region": requested_region,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "pages": pages,
-        "has_prev": page > 1,
-        "has_next": page < pages,
-        "items": slice_items,
-    }
+    payload = {"query": q, "requested_region": requested_region, "total": total,
+               "page": page, "per_page": per_page, "pages": pages,
+               "has_prev": page > 1, "has_next": page < pages, "items": slice_items}
 
-    # лог
+    # Если клиент просит человекочитаемый текст: ?format=cli|text|plain или Accept: text/plain
+    fmt = (request.query_params.get("format") or "").lower()
+    accept = (request.headers.get("accept") or "").lower()
+    want_text = fmt in {"cli", "text", "plain"} or "text/plain" in accept
+    if want_text:
+        from fastapi.responses import PlainTextResponse
+        text = render_cli(payload)
+        return PlainTextResponse(text, headers={"Cache-Control": "no-store"})
+
+    # лог поиска
     try:
-        log_search(request, requested_region, q, page, per_page, total, start)
+        took_ms = int((time.time() - start) * 1000)
+        ip = get_client_ip(request)
+        ua = request.headers.get("user-agent", "")[:400]
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        db_execute("INSERT INTO searches(ts, ip, ua, host, region, q, page, per_page, total, took_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                   (int(time.time()), ip, ua, host, requested_region, q, page, per_page, total, took_ms))
     except Exception as e:
         print(f"[WARN] log_search failed: {e}")
 
     etag = make_etag("v1", q, str(page), str(per_page), requested_region, str(catalog.mtime), "strict" if strict_region else "nostrict")
-    if_none_match = request.headers.get("if-none-match")
-    if if_none_match and if_none_match == etag:
+    if request.headers.get("if-none-match") == etag:
         return JSONResponse(status_code=304, content=None, headers={"ETag": etag})
     return JSONResponse(content=payload, headers={"Cache-Control": "public, max-age=30", "ETag": etag})
 
-# GET: ?q=...
+# ── эндпоинты поиска
 @app.get("/search", response_model=SearchResponse)
 def search_q(request: Request,
              q: str = Query(..., min_length=1),
              page: int = Query(1, ge=1),
              per_page: int = Query(DEFAULT_PER_PAGE, ge=1, le=MAX_PER_PAGE),
-             strict_region: bool = Query(False)):
-    return paginate_and_respond(request, q, page, per_page, strict_region)
+             strict_region: bool = Query(False),
+             region: Optional[str] = Query(None)):
+    ensure_api_allowed(request)
+    return paginate_and_respond(request, q, page, per_page, strict_region, region)
 
-# GET: /search/{q}
 @app.get("/search/{q}", response_model=SearchResponse)
-def search_path(request: Request,
-                q: str,
+def search_path(request: Request, q: str,
                 page: int = Query(1, ge=1),
                 per_page: int = Query(DEFAULT_PER_PAGE, ge=1, le=MAX_PER_PAGE),
-                strict_region: bool = Query(False)):
-    return paginate_and_respond(request, q, page, per_page, strict_region)
+                strict_region: bool = Query(False),
+                region: Optional[str] = Query(None)):
+    ensure_api_allowed(request)
+    return paginate_and_respond(request, q, page, per_page, strict_region, region)
 
-# POST: JSON {q, page, per_page, strict_region}
 @app.post("/search", response_model=SearchResponse)
 def search_post(request: Request, body: SearchRequest = Body(...)):
+    ensure_api_allowed(request)
     per_page = min(MAX_PER_PAGE, max(1, body.per_page))
     page = max(1, body.page)
-    return paginate_and_respond(request, body.q, page, per_page, body.strict_region)
+    return paginate_and_respond(request, body.q, page, per_page, body.strict_region, body.region)
 
-# Клик-трекер: редирект на целевой URL с логированием
-@app.get("/out")
+# ── диагностика
+@app.get("/whoami")
+def whoami(request: Request):
+    return {
+        "x-forwarded-host": request.headers.get("x-forwarded-host"),
+        "host": request.headers.get("host"),
+        "parsed_subdomain": extract_subdomain(request.headers.get("x-forwarded-host") or request.headers.get("host") or ""),
+        "region_param": request.query_params.get("region"),
+        "domain_param": request.query_params.get("domain"),
+        "requested_region": resolve_requested_region(request, region_override=request.query_params.get("region")),
+        "api_key_present": bool(_get_api_key(request)),
+    }
+
+@app.api_route("/out", methods=["GET", "HEAD", "POST"])
 def out(request: Request, u: str = Query(..., description="target URL"), name: str = Query("", description="item name"), price: float = Query(None)):
+    # Всегда редиректим на наш базовый домен, используя то, что пришло в JSON как путь.
+    # Принимаем на вход либо относительный путь, либо полный URL — в любом случае забираем только path+query.
     try:
         parsed = urlparse(u)
-        if parsed.scheme not in ("http", "https"):
-            return PlainTextResponse("Bad redirect", status_code=400)
-        safe_url = urlunparse(parsed)
+        path = parsed.path or u  # если это был относительный путь без схемы
+        query = ("?" + parsed.query) if parsed.query else ""
+        # нормализуем двойные слэши
+        safe_url = SITE_BASE.rstrip("/") + "/" + path.lstrip("/") + query
     except Exception:
         return PlainTextResponse("Bad redirect", status_code=400)
 
@@ -641,15 +741,18 @@ def out(request: Request, u: str = Query(..., description="target URL"), name: s
         ip = get_client_ip(request)
         ua = request.headers.get("user-agent", "")[:400]
         host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-        rows = db_query("SELECT q, region FROM searches WHERE ip=? ORDER BY id DESC LIMIT 1", (ip,))
-        q_src, region_src = (rows[0]["q"], rows[0]["region"]) if rows else ("", "")
-        db_execute(
-            "INSERT INTO clicks(ts, ip, ua, host, region, q, item_name, item_url, price) VALUES(?,?,?,?,?,?,?,?,?)",
-            (int(time.time()), ip, ua, host, region_src, q_src, name[:200] if name else "", safe_url[:2000], float(price) if price is not None else None)
-        )
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("""INSERT INTO clicks(ts, ip, ua, host, region, q, item_name, item_url, price)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (int(time.time()), ip, ua, host, "", "", name[:200] if name else "", safe_url[:2000],
+                         float(price) if price is not None else None))
+            con.commit()
     except Exception as e:
         print(f"[WARN] log click failed: {e}")
 
+    # Для трекинга из JS (sendBeacon POST/HEAD) возвращаем 204 без редиректа
+    if request.method != "GET":
+        return PlainTextResponse("", status_code=204)
     return RedirectResponse(safe_url, status_code=302)
 
 @app.get("/health")
@@ -661,165 +764,28 @@ def debug():
     try:
         catalog.ensure_ready()
         with catalog._lock:
-            return {
+            resp = {
                 "source_url": catalog.source_url,
                 "products_loaded": len(catalog.products),
                 "known_regions": sorted(catalog.known_regions.keys()),
-                "mtime": catalog.mtime,
+                "mtime": catalog.mtime
             }
+            host_sample = os.getenv("DEBUG_HOST", "")
+            req_region = hard_region_from_host(host_sample) if host_sample else None
+            if host_sample:
+                resp["host_seen"] = host_sample
+                resp["requested_region_from_host"] = req_region
+            return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/reload")
-def reload_now():
-    try:
-        catalog.refresh_from_url()
-        return {"status": "ok", "refreshed_at": time.time()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ── подключаем админку из отдельного файла admin.py (если есть)
+try:
+    import admin
+    admin.mount_admin(app)
+except Exception as e:
+    print(f"[WARN] admin module not mounted: {e}")
 
-# ─────────────────────────────────────────────────────────────
-# Простейшая админ-панель /admin?token=...
-# ─────────────────────────────────────────────────────────────
-ADMIN_HTML = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"/>
-<title>Search Monitor</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
-body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial; margin:24px;}
-h1{font-size:20px;margin:0 0 12px;}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px;}
-.card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.05)}
-table{border-collapse:collapse;width:100%}
-th,td{border-bottom:1px solid #eee;padding:8px 6px;text-align:left;font-size:13px;vertical-align:top}
-th{background:#fafafa}
-code{background:#f3f4f6;padding:1px 4px;border-radius:4px}
-small{color:#6b7280}
-.badge{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
-</style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head><body>
-<h1>Search Monitor</h1>
-<div class="cards">
-  <div class="card"><div>Запросов за 24ч: <b id="m1">–</b></div><div>CTR (клики/запросы): <b id="ctr">–</b></div></div>
-  <div class="card"><div>Уник. запросов за 24ч: <b id="m2">–</b></div><div>Средн. выдача (total): <b id="avg">–</b></div></div>
-</div>
-
-<canvas id="chart" height="120"></canvas>
-
-<h2>Последние запросы</h2>
-<table id="qtable"><thead><tr>
-  <th>Время</th><th>q</th><th>total</th><th>регион</th><th>page/per</th><th>IP</th><th>UA</th>
-</tr></thead><tbody></tbody></table>
-
-<h2>Последние клики</h2>
-<table id="ctable"><thead><tr>
-  <th>Время</th><th>q</th><th>name</th><th>url</th><th>цена</th><th>регион</th><th>IP</th>
-</tr></thead><tbody></tbody></table>
-
-<script>
-const token = new URLSearchParams(location.search).get('token');
-async function api(path){
-  const r = await fetch(path + (path.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token));
-  if(!r.ok){document.body.innerHTML='<p>Auth failed</p>';throw new Error('auth');}
-  return r.json();
-}
-function t(ts){const d=new Date(ts*1000);return d.toLocaleString();}
-function esc(s){return (s||'').toString().replace(/[&<>"]/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[m]));}
-
-(async ()=>{
-  const stats = await api('/admin/api/stats24');
-  document.getElementById('m1').textContent = stats.searches_24h;
-  document.getElementById('m2').textContent = stats.unique_q_24h;
-  document.getElementById('avg').textContent = stats.avg_total_24h.toFixed(1);
-  document.getElementById('ctr').textContent = (stats.ctr_24h*100).toFixed(1)+'%';
-
-  const ctx = document.getElementById('chart').getContext('2d');
-  new Chart(ctx, {
-    type:'line',
-    data:{labels:stats.series.hours, datasets:[
-      {label:'Запросы', data:stats.series.counts, tension:.2},
-      {label:'Клики', data:stats.series.clicks, tension:.2}
-    ]},
-    options:{responsive:true, plugins:{legend:{position:'bottom'}}}
-  });
-
-  const qs = await api('/admin/api/last_searches?limit=50');
-  const tb = document.querySelector('#qtable tbody');
-  tb.innerHTML = qs.map(r=>`<tr>
-    <td>${t(r.ts)}</td><td><code>${esc(r.q)}</code></td>
-    <td>${r.total}</td><td>${esc(r.region||'')}</td>
-    <td>${r.page}/${r.per_page}</td><td>${esc(r.ip||'')}</td>
-    <td><small>${esc(r.ua||'')}</small></td>
-  </tr>`).join('');
-
-  const cs = await api('/admin/api/last_clicks?limit=50');
-  const tb2 = document.querySelector('#ctable tbody');
-  tb2.innerHTML = cs.map(r=>`<tr>
-    <td>${t(r.ts)}</td><td><code>${esc(r.q||'')}</code></td>
-    <td>${esc(r.item_name||'')}</td>
-    <td><a href="${esc(r.item_url)}" target="_blank">${esc(r.item_url)}</a></td>
-    <td>${r.price==null?'':r.price}</td><td>${esc(r.region||'')}</td><td>${esc(r.ip||'')}</td>
-  </tr>`).join('');
-})();
-</script>
-</body></html>
-"""
-
-def require_admin_token(request: Request):
-    token = request.query_params.get("token")
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_ui(ok: bool = Depends(require_admin_token)):
-    return HTMLResponse(ADMIN_HTML)
-
-@app.get("/admin/api/stats24")
-def admin_stats24(ok: bool = Depends(require_admin_token)):
-    now = int(time.time())
-    day_ago = now - 24*3600
-    rows_s = db_query("SELECT * FROM searches WHERE ts>=? ORDER BY ts ASC", (day_ago,))
-    rows_c = db_query("SELECT * FROM clicks WHERE ts>=? ORDER BY ts ASC", (day_ago,))
-
-    searches_24h = len(rows_s)
-    unique_q_24h = len({r["q"] for r in rows_s})
-    avg_total_24h = (sum(r["total"] for r in rows_s)/searches_24h) if searches_24h else 0.0
-    ctr_24h = (len(rows_c)/searches_24h) if searches_24h else 0.0
-
-    hours = []; counts = []; clicks = []
-    bucket = {h:0 for h in range(24)}; bucket_c = {h:0 for h in range(24)}
-    for r in rows_s: bucket[(r["ts"]//3600)%24]+=1
-    for r in rows_c: bucket_c[(r["ts"]//3600)%24]+=1
-    for h in range(24):
-        hours.append(f"{h:02d}:00"); counts.append(bucket[h]); clicks.append(bucket_c[h])
-
-    return {
-        "searches_24h": searches_24h,
-        "unique_q_24h": unique_q_24h,
-        "avg_total_24h": avg_total_24h,
-        "ctr_24h": ctr_24h,
-        "series": {"hours": hours, "counts": counts, "clicks": clicks},
-    }
-
-@app.get("/admin/api/last_searches")
-def admin_last_searches(limit: int = 50, ok: bool = Depends(require_admin_token)):
-    limit = max(1, min(500, limit))
-    rows = db_query("SELECT ts, ip, ua, host, region, q, page, per_page, total FROM searches ORDER BY id DESC LIMIT ?", (limit,))
-    return [dict(r) for r in rows]
-
-@app.get("/admin/api/last_clicks")
-def admin_last_clicks(limit: int = 50, ok: bool = Depends(require_admin_token)):
-    limit = max(1, min(500, limit))
-    rows = db_query("SELECT ts, ip, ua, host, region, q, item_name, item_url, price FROM clicks ORDER BY id DESC LIMIT ?", (limit,))
-    return [dict(r) for r in rows]
-
-# ─────────────────────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("search_service:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
