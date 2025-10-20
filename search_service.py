@@ -5,17 +5,20 @@ import os
 import json
 import time
 import re
+import sqlite3
 import unicodedata
 import hashlib
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
+from math import ceil
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
+from urllib.parse import urlparse, urlunparse
 
 import requests
-from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, Query, Request, HTTPException, Body, Depends
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -27,15 +30,16 @@ REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "300"))   # авто-обн
 HTTP_TIMEOUT      = float(os.getenv("HTTP_TIMEOUT", "30.0"))   # таймаут HTTP, сек
 DISK_CACHE_PATH   = Path(os.getenv("DISK_CACHE_PATH", "./catalog_cache.json"))
 
-MAX_PER_PAGE      = 20  # жёсткий потолок
+MAX_PER_PAGE      = 20
 DEFAULT_PER_PAGE  = 20
 
 # Очерёдность регионов для фоллбека, если в запрошенном регионе нет цены
-FALLBACK_PRIORITY = [
-    # new keys first
-    "moscow", "sankt-peterburg", "ekaterinburg", "krasnodar", "sochi", "adler",
-    "spb", "msk", "ekb", "nsk", "nn", "krd",
-]
+FALLBACK_PRIORITY = ["msk", "spb", "moscow", "ekb", "nsk", "nn", "krasnodar", "krd", "adler"]
+
+# Аналитика
+DB_PATH        = Path(os.getenv("ANALYTICS_DB", "./analytics.db"))
+ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "devtoken")   # доступ к /admin?token=...
+KEEP_QUERY_IPS = os.getenv("KEEP_QUERY_IPS", "1") == "1"
 
 # ─────────────────────────────────────────────────────────────
 # Утилиты
@@ -47,6 +51,11 @@ def normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s).replace("Ё", "Е").replace("ё", "е")
     s = s.casefold()
     return WHITESPACE_RE.sub(" ", s).strip()
+
+def normalize_compact(s: str) -> str:
+    """Компакт для артикулов/цифр: только буквы/цифры, без пробелов и знаков."""
+    s = normalize_text(s)
+    return re.sub(r"[^a-z0-9а-я]+", "", s)
 
 TRANS_MAP = str.maketrans({
     "a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и","y":"й",
@@ -145,14 +154,14 @@ class Product(BaseModel):
     # категория/секция/хлебные крошки (если есть)
     category: Optional[str] = None
     section: Optional[str] = None
-    product_section_name: Optional[str] = None
     breadcrumbs: Optional[Union[str, List[str]]] = None
 
-    # внутреннее поле для быстрого поиска
+    # внутренние поля для быстрого поиска
     _search_blob: Optional[str] = None
+    _search_blob_compact: Optional[str] = None
 
 # ─────────────────────────────────────────────────────────────
-# Каталог (URL + ETag/LM + фоновое обновление + дисковый кэш)
+# Каталог
 # ─────────────────────────────────────────────────────────────
 class Catalog:
     def __init__(self, source_url: str, disk_cache: Path):
@@ -172,13 +181,6 @@ class Catalog:
         return self._mtime_marker
 
     def _parse_items(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Пытаемся вытащить список товаров из разных форматов:
-          - JSON-массив: [ {...}, {...} ]
-          - Объект-обёртка: {"items":[...]} / {"data":[...]} / {"products":[...]} / {"catalog":[...]} / {"result":[...]} / {"rows":[...]} / {"list":[...]} / {"goods":[...]}
-          - Объект-словарь: {"123": {...}, "124": {...}}  → берём values()
-          - NDJSON: по строке на объект
-        """
         try:
             parsed = json.loads(text)
         except Exception:
@@ -225,23 +227,19 @@ class Catalog:
                 url  = it.get("url") or it.get("link"),
                 img  = img,
                 measure_code = it.get("measure_code") or it.get("unit"),
-                sale  = it.get("sale") if it.get("sale") is not None else it.get("has_sale"),
+                sale  = it.get("sale"),
                 is_hit= it.get("is_hit"),
                 discount_percent = it.get("discount_percent"),
                 prices = prices_map,
-
                 image = it.get("image") or it.get("picture"),
                 id_code = it.get("id_code") or it.get("code") or it.get("sku"),
                 currency = it.get("currency") or "RUB",
                 type = it.get("type") or it.get("category"),
-
-                category = it.get("product_section_name") or it.get("category") or it.get("section"),
-                section = it.get("section") or it.get("product_section_url"),
-                product_section_name = it.get("product_section_name"),
+                category = it.get("category") or it.get("section"),
+                section = it.get("section"),
                 breadcrumbs = it.get("breadcrumbs") or it.get("path") or it.get("trail"),
             )
 
-            # поисковый blob из ключевых полей
             crumbs = p.breadcrumbs
             if isinstance(crumbs, list):
                 crumbs = " / ".join(map(str, crumbs))
@@ -250,12 +248,13 @@ class Catalog:
                 p.type or "",
                 p.category or "",
                 p.section or "",
-                p.product_section_name or "",
                 crumbs or "",
                 p.url or "",
                 p.id_code or "",
             ]
-            p._search_blob = normalize_text(" ".join(part for part in blob_parts if part))
+            blob = normalize_text(" ".join(part for part in blob_parts if part))
+            p._search_blob = blob
+            p._search_blob_compact = normalize_compact(blob)
 
             products.append(p)
 
@@ -332,7 +331,7 @@ class Catalog:
             return
         self._stop_event.clear()
         t = threading.Thread(target=self._refresh_loop, name="catalog-refresh", daemon=True)
-        t.start()  # ВАЖНО: запуск потока
+        t.start()
         self._bg_thread = t
 
     def stop_background_refresh(self):
@@ -346,117 +345,61 @@ class Catalog:
                 print(f"[WARN] Periodic refresh failed: {e}")
             self._stop_event.wait(REFRESH_SECONDS)
 
-    # Поиск без пагинации (лист результатов)
+    # Поиск
     def search_all(self, query: str, requested_region: str, strict_region: bool = False) -> List[Dict[str, Any]]:
         self.ensure_ready()
-        q = normalize_text(query)
-        q_ru = normalize_text(naive_lat_to_ru(query))
-        tokens = [t for t in q.split(" ") if t]
-        tokens_ru = [t for t in q_ru.split(" ") if t]
 
-        # --- Category-first detection ---
-        # Build a set of distinct normalized section/category names present in the catalog
+        q_lat = normalize_text(query)                 # латиница как есть
+        q_ru  = normalize_text(naive_lat_to_ru(query))# «псевдо-ру»
+        tokens_lat = [t for t in q_lat.split(" ") if t]
+        tokens_ru  = [t for t in q_ru.split(" ") if t]
+
+        STOP = {"quick", "step", "quickstep", "qs"}   # брендовые стоп-слова
+
+        # сильные (с цифрами)
+        strong_lat = [t for t in tokens_lat if any(ch.isdigit() for ch in t)]
+        strong_ru  = [t for t in tokens_ru  if any(ch.isdigit() for ch in t)]
+        # слабые (без цифр, не стоп-слова)
+        weak_lat = [t for t in tokens_lat if not any(ch.isdigit() for ch in t) and t not in STOP]
+        weak_ru  = [t for t in tokens_ru  if not any(ch.isdigit() for ch in t) and t not in STOP]
+
         with self._lock:
-            products_snapshot = list(self.products)
-        distinct_cats: Dict[str, str] = {}
-        for _p in products_snapshot:
-            cat_raw = _p.category or _p.product_section_name or ""
-            cat_norm = normalize_text(cat_raw)
-            if cat_norm:
-                distinct_cats[cat_norm] = cat_raw
-
-        # Choose the longest category name that appears in the query (ru or translit)
-        q_norm = normalize_text(query)
-        q_norm_ru = normalize_text(naive_lat_to_ru(query))
-        matched_cat_norm: Optional[str] = None
-        if distinct_cats:
-            candidates = [c for c in distinct_cats.keys() if c and (c in q_norm or c in q_norm_ru)]
-            if candidates:
-                # prefer the longest textual match to avoid substring collisions
-                matched_cat_norm = sorted(candidates, key=len, reverse=True)[0]
-
-        # If a category was detected, treat remaining tokens as brand/model filters (match in name only)
-        brand_tokens = tokens[:]
-        brand_tokens_ru = tokens_ru[:]
-        if matched_cat_norm:
-            cat_tokens = matched_cat_norm.split()
-            brand_tokens     = [t for t in brand_tokens if t not in cat_tokens]
-            brand_tokens_ru  = [t for t in brand_tokens_ru if t not in cat_tokens]
-
-        # синонимы по «категорийным» ключам
-        SYN: Dict[str, set] = {
-            "ламинат": {"ламинат", "laminat", "лам."},
-            "плитка": {"плитка", "plitka", "керамика", "керамогранит", "keram"},
-            "пвх": {"пвх", "pvh", "винил", "vinyl", "spc", "lvt"},
-        }
-        syn_set = SYN.get(q, set())
-
-        # эвристика по категориям, если явной категории нет в JSON
-        # для «ламинат»: берём м², исключаем ПВХ/винил/SPC/LVT/керам.
-        LAMINATE_NEG_MARKERS = {"пвх", "винил", "spc", "lvt", "керам", "плитк", "vinyl", "keram"}
-        is_laminate_query = q in SYN and "ламинат" in SYN
-
-        products = products_snapshot
+            products = list(self.products)
 
         result: List[Dict[str, Any]] = []
         for p in products:
-            crumbs = p.breadcrumbs
-            if isinstance(crumbs, list):
-                crumbs = " / ".join(map(str, crumbs))
-            blob = p._search_blob or normalize_text(" ".join(filter(None, [
-                p.name, p.type, p.category, p.section, crumbs or "", p.url, p.id_code
-            ])))
+            blob = p._search_blob or ""
+            blob_compact = p._search_blob_compact or normalize_compact(blob)
 
-            # строгий матч: все токены должны входить (рус+транслит)
-            ok_all    = all(t in blob for t in tokens) if tokens else True
-            ok_all_ru = all(t in blob for t in tokens_ru) if tokens_ru else True
-            # либеральный матч: любой токен
-            ok_any    = any(t in blob for t in tokens) if tokens else True
-            ok_any_ru = any(t in blob for t in tokens_ru) if tokens_ru else True
-            syn_hit   = any(w in blob for w in syn_set) if syn_set else False
+            # 1) сильные — «все обязательны» по схеме (LAT ИЛИ RU)
+            def all_in_compact(need: List[str]) -> bool:
+                return all(normalize_compact(t) in blob_compact for t in need) if need else True
 
-            matched = False
-
-            # Category-first logic: if the query contains a known category,
-            # require the product to belong to that category. If there are extra terms,
-            # match them in the NAME only (brand/model constraint).
-            if matched_cat_norm:
-                prod_cat_norm = normalize_text(p.category or p.product_section_name or "")
-                if prod_cat_norm == matched_cat_norm:
-                    if brand_tokens or brand_tokens_ru:
-                        name_norm = normalize_text(p.name or "")
-                        brand_all = all(t in name_norm for t in brand_tokens) if brand_tokens else True
-                        brand_all_ru = all(t in name_norm for t in brand_tokens_ru) if brand_tokens_ru else True
-                        matched = brand_all or brand_all_ru
-                    else:
-                        matched = True
-            else:
-                # default relevance (previous behavior)
-                matched = (ok_all or ok_all_ru) or syn_hit or (ok_any or ok_any_ru)
-
-            # Категорийная эвристика для «ламинат»
-            if not matched and is_laminate_query:
-                # единица измерения м² и нет негативных маркеров
-                is_m2 = (p.measure_code or "").replace("²", "2").strip().lower() in {"м2", "м^2", "m2"}
-                has_neg = any(m in blob for m in LAMINATE_NEG_MARKERS)
-                if is_m2 and not has_neg:
-                    matched = True
-
-            if not matched:
+            strong_ok = True
+            if strong_lat or strong_ru:
+                strong_ok = (all_in_compact(strong_lat) or all_in_compact(strong_ru))
+            if not strong_ok:
                 continue
 
-            # цена: сначала запрошенный регион
+            # 2) слабые — «все обязательны» по схеме (LAT ИЛИ RU)
+            def all_in_blob(need: List[str]) -> bool:
+                return all(t in blob for t in need) if need else True
+
+            weak_ok = True
+            if weak_lat or weak_ru:
+                weak_ok = (all_in_blob(weak_lat) or all_in_blob(weak_ru))
+            if not weak_ok:
+                continue
+
+            # 3) цены/регион
             price_block = p.prices.get(requested_region)
             price = price_block["price"] if price_block else None
             price_old = price_block["price_old"] if price_block else None
             used_region = requested_region if price is not None else None
 
-            # если нет цены в запрошенном регионе
             if price is None:
                 if strict_region:
-                    # пропускаем товар
                     continue
-                # пробуем по приоритету
                 for rk in FALLBACK_PRIORITY:
                     blk = p.prices.get(rk)
                     if blk and blk.get("price") is not None:
@@ -464,7 +407,6 @@ class Catalog:
                         price_old = blk.get("price_old")
                         used_region = rk
                         break
-                # если по приоритету нет — берём первую доступную
                 if price is None:
                     for rk in sorted(p.prices.keys()):
                         blk = p.prices[rk]
@@ -474,25 +416,11 @@ class Catalog:
                             used_region = rk
                             break
 
-            # скоринг: покрытие токенов + бонусы
+            # 4) скоринг
             score = 0
-            # base coverage
-            score += sum(1 for t in tokens if t and t in blob)
-            score += sum(1 for t in tokens_ru if t and t in blob)
-            if ok_all or ok_all_ru:
-                score += 3
-            if syn_hit:
-                score += 1
-            if matched_cat_norm:
-                prod_cat_norm = normalize_text(p.category or p.product_section_name or "")
-                if prod_cat_norm == matched_cat_norm:
-                    score += 10  # strong boost for category match
-                    # extra boost per matched brand token in NAME only
-                    name_norm = normalize_text(p.name or "")
-                    score += 2 * sum(1 for t in brand_tokens if t in name_norm)
-                    score += 2 * sum(1 for t in brand_tokens_ru if t in name_norm)
-            if is_laminate_query and matched and p.measure_code and "м" in p.measure_code:
-                score += 1
+            if strong_lat or strong_ru:
+                score += 5
+            score += len(weak_lat) or len(weak_ru)
 
             result.append({
                 "name": p.name,
@@ -510,7 +438,6 @@ class Catalog:
                 "_score": score,
             })
 
-        # сортировка: релевантность ↓, цена ↑, имя
         def price_key(x):
             return (x["price"] is None, x["price"] if x["price"] is not None else float("inf"))
         result.sort(key=lambda x: (-x["_score"],) + price_key(x) + (x["name"] or "",))
@@ -521,10 +448,65 @@ class Catalog:
 catalog = Catalog(PRODUCTS_JSON_URL, DISK_CACHE_PATH)
 
 # ─────────────────────────────────────────────────────────────
-# Lifespan (вместо deprecated on_event)
+# Аналитика (SQLite)
+# ─────────────────────────────────────────────────────────────
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS searches(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            ip TEXT,
+            ua TEXT,
+            host TEXT,
+            region TEXT,
+            q TEXT NOT NULL,
+            page INTEGER,
+            per_page INTEGER,
+            total INTEGER,
+            took_ms INTEGER
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS clicks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            ip TEXT,
+            ua TEXT,
+            host TEXT,
+            region TEXT,
+            q TEXT,
+            item_name TEXT,
+            item_url TEXT,
+            price REAL
+        )""")
+        con.commit()
+
+def db_execute(sql: str, args: Tuple[Any, ...] = ()):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(sql, args)
+        con.commit()
+
+def db_query(sql: str, args: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute(sql, args)
+        return cur.fetchall()
+
+def get_client_ip(request: Request) -> str:
+    if not KEEP_QUERY_IPS:
+        return ""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+# ─────────────────────────────────────────────────────────────
+# Lifespan
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
     try:
         catalog.ensure_ready()
     except Exception as e:
@@ -536,14 +518,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────
 # FastAPI
 # ─────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Upravdom Search API",
-    version="1.9.0",
-    lifespan=lifespan,
-    docs_url="/swagger",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
-)
+app = FastAPI(title="Upravdom Search API", version="2.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -551,11 +526,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# Root redirect to Swagger UI
-@app.get("/", include_in_schema=False)
-def root_redirect():
-    return RedirectResponse(url="/swagger")
 
 class SearchResponse(BaseModel):
     query: str
@@ -568,14 +538,24 @@ class SearchResponse(BaseModel):
     has_next: bool
     items: List[Dict[str, Any]]
 
-# POST body model for search
-class SearchBody(BaseModel):
+class SearchRequest(BaseModel):
     q: str
     page: int = 1
     per_page: int = DEFAULT_PER_PAGE
     strict_region: bool = False
 
+def log_search(request: Request, region: str, q: str, page: int, per_page: int, total: int, started: float):
+    took_ms = int((time.time() - started) * 1000)
+    ip = get_client_ip(request)
+    ua = request.headers.get("user-agent", "")[:400]
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    db_execute(
+        "INSERT INTO searches(ts, ip, ua, host, region, q, page, per_page, total, took_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (int(time.time()), ip, ua, host, region, q, page, per_page, total, took_ms)
+    )
+
 def paginate_and_respond(request: Request, q: str, page: int, per_page: int, strict_region: bool) -> JSONResponse:
+    start = time.time()
     catalog.ensure_ready()
     with catalog._lock:
         known = set(catalog.known_regions.keys())
@@ -593,9 +573,9 @@ def paginate_and_respond(request: Request, q: str, page: int, per_page: int, str
     if page > pages:
         page = pages
 
-    start = (page - 1) * per_page
-    end = start + per_page
-    slice_items = all_items[start:end]
+    start_i = (page - 1) * per_page
+    end_i = start_i + per_page
+    slice_items = all_items[start_i:end_i]
 
     payload = {
         "query": q,
@@ -609,13 +589,19 @@ def paginate_and_respond(request: Request, q: str, page: int, per_page: int, str
         "items": slice_items,
     }
 
+    # лог
+    try:
+        log_search(request, requested_region, q, page, per_page, total, start)
+    except Exception as e:
+        print(f"[WARN] log_search failed: {e}")
+
     etag = make_etag("v1", q, str(page), str(per_page), requested_region, str(catalog.mtime), "strict" if strict_region else "nostrict")
     if_none_match = request.headers.get("if-none-match")
     if if_none_match and if_none_match == etag:
         return JSONResponse(status_code=304, content=None, headers={"ETag": etag})
     return JSONResponse(content=payload, headers={"Cache-Control": "public, max-age=30", "ETag": etag})
 
-# Вариант 1: query string (?q=...)
+# GET: ?q=...
 @app.get("/search", response_model=SearchResponse)
 def search_q(request: Request,
              q: str = Query(..., min_length=1),
@@ -624,22 +610,47 @@ def search_q(request: Request,
              strict_region: bool = Query(False)):
     return paginate_and_respond(request, q, page, per_page, strict_region)
 
-# POST /search endpoint
-@app.post("/search", response_model=SearchResponse)
-def search_post(request: Request, body: SearchBody):
-    return paginate_and_respond(request, body.q, body.page, body.per_page, body.strict_region)
-
-# Вариант 2: человекочитаемый путь /search/ламинат
-@app.get("/search/{q:path}", response_model=SearchResponse)
+# GET: /search/{q}
+@app.get("/search/{q}", response_model=SearchResponse)
 def search_path(request: Request,
                 q: str,
                 page: int = Query(1, ge=1),
                 per_page: int = Query(DEFAULT_PER_PAGE, ge=1, le=MAX_PER_PAGE),
                 strict_region: bool = Query(False)):
-    # Be tolerant: treat plus as space and collapse multiple spaces
-    q = q.replace("+", " ")
-    q = WHITESPACE_RE.sub(" ", q).strip()
     return paginate_and_respond(request, q, page, per_page, strict_region)
+
+# POST: JSON {q, page, per_page, strict_region}
+@app.post("/search", response_model=SearchResponse)
+def search_post(request: Request, body: SearchRequest = Body(...)):
+    per_page = min(MAX_PER_PAGE, max(1, body.per_page))
+    page = max(1, body.page)
+    return paginate_and_respond(request, body.q, page, per_page, body.strict_region)
+
+# Клик-трекер: редирект на целевой URL с логированием
+@app.get("/out")
+def out(request: Request, u: str = Query(..., description="target URL"), name: str = Query("", description="item name"), price: float = Query(None)):
+    try:
+        parsed = urlparse(u)
+        if parsed.scheme not in ("http", "https"):
+            return PlainTextResponse("Bad redirect", status_code=400)
+        safe_url = urlunparse(parsed)
+    except Exception:
+        return PlainTextResponse("Bad redirect", status_code=400)
+
+    try:
+        ip = get_client_ip(request)
+        ua = request.headers.get("user-agent", "")[:400]
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        rows = db_query("SELECT q, region FROM searches WHERE ip=? ORDER BY id DESC LIMIT 1", (ip,))
+        q_src, region_src = (rows[0]["q"], rows[0]["region"]) if rows else ("", "")
+        db_execute(
+            "INSERT INTO clicks(ts, ip, ua, host, region, q, item_name, item_url, price) VALUES(?,?,?,?,?,?,?,?,?)",
+            (int(time.time()), ip, ua, host, region_src, q_src, name[:200] if name else "", safe_url[:2000], float(price) if price is not None else None)
+        )
+    except Exception as e:
+        print(f"[WARN] log click failed: {e}")
+
+    return RedirectResponse(safe_url, status_code=302)
 
 @app.get("/health")
 def health():
@@ -667,6 +678,148 @@ def reload_now():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────────────────────
+# Простейшая админ-панель /admin?token=...
+# ─────────────────────────────────────────────────────────────
+ADMIN_HTML = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"/>
+<title>Search Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial; margin:24px;}
+h1{font-size:20px;margin:0 0 12px;}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px;}
+.card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+table{border-collapse:collapse;width:100%}
+th,td{border-bottom:1px solid #eee;padding:8px 6px;text-align:left;font-size:13px;vertical-align:top}
+th{background:#fafafa}
+code{background:#f3f4f6;padding:1px 4px;border-radius:4px}
+small{color:#6b7280}
+.badge{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head><body>
+<h1>Search Monitor</h1>
+<div class="cards">
+  <div class="card"><div>Запросов за 24ч: <b id="m1">–</b></div><div>CTR (клики/запросы): <b id="ctr">–</b></div></div>
+  <div class="card"><div>Уник. запросов за 24ч: <b id="m2">–</b></div><div>Средн. выдача (total): <b id="avg">–</b></div></div>
+</div>
+
+<canvas id="chart" height="120"></canvas>
+
+<h2>Последние запросы</h2>
+<table id="qtable"><thead><tr>
+  <th>Время</th><th>q</th><th>total</th><th>регион</th><th>page/per</th><th>IP</th><th>UA</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Последние клики</h2>
+<table id="ctable"><thead><tr>
+  <th>Время</th><th>q</th><th>name</th><th>url</th><th>цена</th><th>регион</th><th>IP</th>
+</tr></thead><tbody></tbody></table>
+
+<script>
+const token = new URLSearchParams(location.search).get('token');
+async function api(path){
+  const r = await fetch(path + (path.includes('?')?'&':'?') + 'token=' + encodeURIComponent(token));
+  if(!r.ok){document.body.innerHTML='<p>Auth failed</p>';throw new Error('auth');}
+  return r.json();
+}
+function t(ts){const d=new Date(ts*1000);return d.toLocaleString();}
+function esc(s){return (s||'').toString().replace(/[&<>"]/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[m]));}
+
+(async ()=>{
+  const stats = await api('/admin/api/stats24');
+  document.getElementById('m1').textContent = stats.searches_24h;
+  document.getElementById('m2').textContent = stats.unique_q_24h;
+  document.getElementById('avg').textContent = stats.avg_total_24h.toFixed(1);
+  document.getElementById('ctr').textContent = (stats.ctr_24h*100).toFixed(1)+'%';
+
+  const ctx = document.getElementById('chart').getContext('2d');
+  new Chart(ctx, {
+    type:'line',
+    data:{labels:stats.series.hours, datasets:[
+      {label:'Запросы', data:stats.series.counts, tension:.2},
+      {label:'Клики', data:stats.series.clicks, tension:.2}
+    ]},
+    options:{responsive:true, plugins:{legend:{position:'bottom'}}}
+  });
+
+  const qs = await api('/admin/api/last_searches?limit=50');
+  const tb = document.querySelector('#qtable tbody');
+  tb.innerHTML = qs.map(r=>`<tr>
+    <td>${t(r.ts)}</td><td><code>${esc(r.q)}</code></td>
+    <td>${r.total}</td><td>${esc(r.region||'')}</td>
+    <td>${r.page}/${r.per_page}</td><td>${esc(r.ip||'')}</td>
+    <td><small>${esc(r.ua||'')}</small></td>
+  </tr>`).join('');
+
+  const cs = await api('/admin/api/last_clicks?limit=50');
+  const tb2 = document.querySelector('#ctable tbody');
+  tb2.innerHTML = cs.map(r=>`<tr>
+    <td>${t(r.ts)}</td><td><code>${esc(r.q||'')}</code></td>
+    <td>${esc(r.item_name||'')}</td>
+    <td><a href="${esc(r.item_url)}" target="_blank">${esc(r.item_url)}</a></td>
+    <td>${r.price==null?'':r.price}</td><td>${esc(r.region||'')}</td><td>${esc(r.ip||'')}</td>
+  </tr>`).join('');
+})();
+</script>
+</body></html>
+"""
+
+def require_admin_token(request: Request):
+    token = request.query_params.get("token")
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_ui(ok: bool = Depends(require_admin_token)):
+    return HTMLResponse(ADMIN_HTML)
+
+@app.get("/admin/api/stats24")
+def admin_stats24(ok: bool = Depends(require_admin_token)):
+    now = int(time.time())
+    day_ago = now - 24*3600
+    rows_s = db_query("SELECT * FROM searches WHERE ts>=? ORDER BY ts ASC", (day_ago,))
+    rows_c = db_query("SELECT * FROM clicks WHERE ts>=? ORDER BY ts ASC", (day_ago,))
+
+    searches_24h = len(rows_s)
+    unique_q_24h = len({r["q"] for r in rows_s})
+    avg_total_24h = (sum(r["total"] for r in rows_s)/searches_24h) if searches_24h else 0.0
+    ctr_24h = (len(rows_c)/searches_24h) if searches_24h else 0.0
+
+    hours = []; counts = []; clicks = []
+    bucket = {h:0 for h in range(24)}; bucket_c = {h:0 for h in range(24)}
+    for r in rows_s: bucket[(r["ts"]//3600)%24]+=1
+    for r in rows_c: bucket_c[(r["ts"]//3600)%24]+=1
+    for h in range(24):
+        hours.append(f"{h:02d}:00"); counts.append(bucket[h]); clicks.append(bucket_c[h])
+
+    return {
+        "searches_24h": searches_24h,
+        "unique_q_24h": unique_q_24h,
+        "avg_total_24h": avg_total_24h,
+        "ctr_24h": ctr_24h,
+        "series": {"hours": hours, "counts": counts, "clicks": clicks},
+    }
+
+@app.get("/admin/api/last_searches")
+def admin_last_searches(limit: int = 50, ok: bool = Depends(require_admin_token)):
+    limit = max(1, min(500, limit))
+    rows = db_query("SELECT ts, ip, ua, host, region, q, page, per_page, total FROM searches ORDER BY id DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]
+
+@app.get("/admin/api/last_clicks")
+def admin_last_clicks(limit: int = 50, ok: bool = Depends(require_admin_token)):
+    limit = max(1, min(500, limit))
+    rows = db_query("SELECT ts, ip, ua, host, region, q, item_name, item_url, price FROM clicks ORDER BY id DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]
+
+# ─────────────────────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("search_service:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
